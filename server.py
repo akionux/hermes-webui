@@ -582,6 +582,19 @@ def main() -> None:
         # Recovery is best-effort; never block server startup.
         print(f"[recovery] startup recovery failed: {exc}", flush=True)
 
+    try:
+        from api.run_journal import maybe_prune_run_journals
+        result = maybe_prune_run_journals()
+        if result.get("status") == "pruned" and result.get("removed"):
+            print(
+                f"[retention] Pruned {len(result['removed'])} finished run journal(s) "
+                f"(skipped {result.get('skipped_unfinished', 0)} unfinished).",
+                flush=True,
+            )
+    except Exception as exc:
+        # Retention is best-effort; never block server startup.
+        print(f"[retention] run-journal prune pass failed: {exc}", flush=True)
+
     within_container = False
     try:
         with open('/.within_container', 'r') as f:

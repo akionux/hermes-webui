@@ -65,6 +65,9 @@ _SNAPSHOT_ARGS_MAX_DEPTH = 8
 _SNAPSHOT_ARGS_MAX_STRING_CHARS = 8192
 _SNAPSHOT_ARGS_MAX_TOTAL_CHARS = 64 * 1024
 _SNAPSHOT_ARGS_TRUNCATED_SUFFIX = "...[truncated]"
+# Retention scan reads only a file tail to find the terminal event; per-line
+# payloads can be large, so the window is generous but still bounded.
+_RETENTION_TAIL_READ_BYTES = 1024 * 1024
 
 
 def _default_session_dir() -> Path:
@@ -837,6 +840,143 @@ def delete_run_journal(session_id: str, *, session_dir: Path | None = None) -> b
             for cache_key in [entry for entry in _SUMMARY_CACHE if str(Path(entry).parent) == dir_key]:
                 del _SUMMARY_CACHE[cache_key]
     return removed
+
+
+def _read_terminal_tail(path: Path) -> dict | None:
+    """Return the authoritative terminal event of a run journal, cheaply.
+
+    Only the file tail is read (terminal events live at the end of a run and
+    each line is bounded), so this stays O(1)-ish regardless of journal size —
+    unlike ``_read_jsonl``-based summary paths, a retention scan must never pay
+    a full parse just to learn whether a run finished and when. Returns ``None``
+    when no parseable terminal event is found (run still in flight, or the file
+    is not readable/parseable), which callers treat as "keep".
+    """
+    found: dict | None = None
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as fh:
+            if size > _RETENTION_TAIL_READ_BYTES:
+                fh.seek(max(0, size - _RETENTION_TAIL_READ_BYTES))
+                # Drop the (possibly partial) first line of the tail window.
+                fh.readline()
+            for raw in fh:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    event = json.loads(raw)
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                if isinstance(event, dict) and event.get("terminal"):
+                    # Keep the LAST terminal row (same rule as select_authoritative_terminal_event).
+                    found = event
+    except OSError:
+        return None
+    return found
+
+
+def prune_run_journals(
+    *,
+    retention_days: float = 7.0,
+    session_dir: Path | None = None,
+    now: float | None = None,
+) -> dict:
+    """Delete finished run journals whose terminal event predates the window.
+
+    RFC turn-journal step 5 ("prune completed journal entries older than a
+    retention window"). Rules:
+
+    * A run file is removed only when it contains a parseable TERMINAL event and
+      that event's ``created_at`` is older than ``retention_days`` — the journal
+      body is authoritative, not the filesystem mtime.
+    * Runs without a terminal event (still in flight / awaiting recovery) are
+      never touched, no matter how old the file is.
+    * A per-session directory is rmtree'd only when EVERY file inside it qualifies.
+    * Never raises: unreadable files simply survive.
+    """
+    root = Path(session_dir) if session_dir is not None else _default_session_dir()
+    journal_root = root / RUN_JOURNAL_DIR_NAME
+    cutoff = (now if now is not None else time.time()) - max(0.0, float(retention_days)) * 86400.0
+    removed: list[str] = []
+    skipped_unfinished = 0
+    if not journal_root.exists():
+        return {"removed": removed, "skipped_unfinished": 0}
+    for sid_dir in sorted(p for p in journal_root.iterdir() if p.is_dir()):
+        survivors = 0
+        eligible: list[Path] = []
+        for path in sorted(sid_dir.glob("*.jsonl")):
+            terminal_event = _read_terminal_tail(path)
+            if terminal_event is None:
+                # In-flight or unparseable — retention never deletes those.
+                survivors += 1
+                skipped_unfinished += 1
+                continue
+            created_at = _event_created_at(terminal_event, fallback=0.0)
+            if created_at and created_at >= cutoff:
+                survivors += 1
+            else:
+                eligible.append(path)
+        if not eligible:
+            continue
+        if survivors == 0:
+            # Whole session's journal expired: drop the directory (same shape as
+            # delete_run_journal, which also evicts the per-path caches below).
+            sid = sid_dir.name
+            if delete_run_journal(sid, session_dir=root):
+                removed.extend(f"{sid}/{p.stem}" for p in eligible)
+            continue
+        for path in eligible:
+            try:
+                path.unlink()
+            except OSError:
+                survivors += 1
+                continue
+            _discard_cached_summary(path)
+            removed.append(f"{sid_dir.name}/{path.stem}")
+    return {"removed": removed, "skipped_unfinished": skipped_unfinished}
+
+
+_RETENTION_DAYS_ENV = "HERMES_WEBUI_RUN_JOURNAL_RETENTION_DAYS"
+_RETENTION_INTERVAL_ENV = "HERMES_WEBUI_RUN_JOURNAL_PRUNE_INTERVAL_HOURS"
+_LAST_PRUNE_MARKER_NAME = ".last_prune_at"
+
+
+def maybe_prune_run_journals(*, session_dir: Path | None = None, now: float | None = None) -> dict:
+    """Daily-guarded entrypoint for the startup retention pass.
+
+    Reads ``HERMES_WEBUI_RUN_JOURNAL_RETENTION_DAYS`` (default 7; 0 disables).
+    A marker file inside ``_run_journal/`` records the last run so repeated
+    restarts within the interval (see ``..._PRUNE_INTERVAL_HOURS``, default 24)
+    do not rescan the corpus. The marker timestamp is advanced BEFORE deleting
+    anything, so a crash mid-prune retries next window without rescanning what
+    it already removed.
+    """
+    root = Path(session_dir) if session_dir is not None else _default_session_dir()
+    journal_root = root / RUN_JOURNAL_DIR_NAME
+    now_ts = now if now is not None else time.time()
+    try:
+        retention_days = float(os.environ.get(_RETENTION_DAYS_ENV, "7"))
+    except ValueError:
+        retention_days = 7.0
+    if retention_days <= 0:
+        return {"removed": [], "skipped_unfinished": 0, "status": "disabled"}
+    try:
+        interval_s = float(os.environ.get(_RETENTION_INTERVAL_ENV, "24")) * 3600.0
+    except ValueError:
+        interval_s = 86400.0
+    marker = journal_root / _LAST_PRUNE_MARKER_NAME
+    try:
+        if marker.exists() and (now_ts - marker.stat().st_mtime) < interval_s:
+            return {"removed": [], "skipped_unfinished": 0, "status": "within-interval"}
+        journal_root.mkdir(parents=True, exist_ok=True)
+        marker.touch()  # advance the guard first (crash-safe, above)
+        os.utime(marker, (now_ts, now_ts))
+    except OSError:
+        pass
+    result = prune_run_journals(retention_days=retention_days, session_dir=root, now=now_ts)
+    result["status"] = "pruned"
+    return result
 
 
 def stale_interrupted_event(session_id: str, run_id: str, *, after_seq: int | None = None) -> dict | None:
