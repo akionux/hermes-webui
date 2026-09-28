@@ -1337,6 +1337,52 @@ def maybe_prune_run_journals(*, session_dir: Path | None = None, now: float | No
     return result
 
 
+def finalize_active_runs_on_shutdown(active_runs: dict, *, session_dir: Path | None = None) -> dict:
+    """Append the interrupted terminal row to every still-open run on shutdown.
+
+    ``active_runs`` maps stream_id -> ACTIVE_RUNS metadata (needs
+    ``session_id``). A run whose journal already carries a terminal row is left
+    untouched; an open one gets the same synthetic terminal row
+    ``stale_interrupted_event`` shows readers, so the durable record of a turn
+    killed by a service restart ends terminal instead of dangling "running".
+    """
+    finalized: list[str] = []
+    skipped_terminal: list[str] = []
+    for stream_id, meta in sorted((active_runs or {}).items()):
+        session_id = str((meta or {}).get("session_id") or "")
+        if not session_id:
+            continue
+        try:
+            sid = _validate_id(session_id, "session_id")
+            rid = _validate_id(str(stream_id), "run_id")
+        except ValueError:
+            continue
+        path = _run_path(sid, rid, session_dir=session_dir)
+        state = _probe_state_for(path)
+        if state is None:
+            continue  # no journal at all — nothing to close
+        if state.get("terminal_event") is not None:
+            skipped_terminal.append(str(stream_id))
+            continue
+        if not int(state.get("event_count") or 0):
+            skipped_terminal.append(str(stream_id))
+            continue
+        payload = {
+            "type": "interrupted",
+            "recovery_control": True,
+            "message": "The live worker stopped before this run finished.",
+            "hint": "The transcript was restored to the last journaled event. "
+                    "Start a new turn if you still need the task to continue.",
+            "session_id": sid, "stream_id": rid, "journal_last_seq": state.get("last_seq"),
+        }
+        try:
+            append_run_event(sid, rid, "apperror", payload, session_dir=session_dir)
+        except Exception:
+            continue
+        finalized.append(str(stream_id))
+    return {"finalized": finalized, "skipped_terminal": skipped_terminal}
+
+
 def stale_interrupted_event(session_id: str, run_id: str, *, after_seq: int | None = None) -> dict | None:
     summary = latest_run_summary(session_id, run_id)
     if summary.get("terminal") or not summary.get("event_count"):

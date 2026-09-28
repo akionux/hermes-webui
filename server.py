@@ -758,5 +758,17 @@ def main() -> None:
             stop_session_channel_reaper()
         except Exception:
             logger.debug("Failed to stop SessionChannel reaper during shutdown", exc_info=True)
+        try:
+            # A turn killed by THIS restart must not dangle "running" in its
+            # journal: close every still-open ACTIVE_RUNS journal with the
+            # interrupted terminal row before the process exits.
+            from api.config import ACTIVE_RUNS
+            from api.run_journal import finalize_active_runs_on_shutdown
+            res = finalize_active_runs_on_shutdown(dict(ACTIVE_RUNS))
+            if res.get("finalized"):
+                print(f"[shutdown] Closed {len(res['finalized'])} interrupted run journal(s) "
+                      f"with terminal rows.", flush=True)
+        except Exception:
+            logger.debug("Failed to finalize active run journals during shutdown", exc_info=True)
 if __name__ == '__main__':
     main()
