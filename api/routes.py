@@ -3485,12 +3485,10 @@ def _run_journal_live_snapshot(stream_id: str | None, *, handler=None) -> dict |
         emit_error=False,
     ):
         return None
-    # Locate the run journal WITHOUT parsing it first. find_run_summary reads
-    # and parses the whole file (tens of thousands of rows on a long live
-    # run), and read_run_events below then parsed it AGAIN — two full passes
-    # cost ~0.6s per rebuild. Derive the durable summary from the single
-    # parse below instead; its last_seq / last_event_id are rebuilt from the
-    # same rows the snapshot consumes.
+    # Locate the run journal WITHOUT parsing it first (upstream #stage-0926).
+    # The incremental filtered reader below parses only content lines, once per
+    # process, and folds appended regions on later requests — so the snapshot
+    # never pays a second full pass and mid-turn reloads cost O(new bytes).
     located = find_run_file(stream_id)
     if located:
         session_id, _journal_path = located
@@ -3505,7 +3503,7 @@ def _run_journal_live_snapshot(stream_id: str | None, *, handler=None) -> dict |
         session_id = str(fallback_summary.get("session_id") or "")
         if not session_id:
             return None
-    journal = read_run_events(session_id, stream_id)
+    journal = read_filtered_run_events(session_id, stream_id)
     events = [event for event in (journal.get("events") or []) if isinstance(event, dict)]
     if not events:
         return None
@@ -11070,6 +11068,7 @@ from api.run_journal import (
     find_run_summary,
     journal_replay_visible,
     read_run_events,
+    read_filtered_run_events,
     read_session_run_events,
     session_journal_fingerprint,
     stale_interrupted_event,

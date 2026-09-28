@@ -220,10 +220,10 @@ def test_summary_cache_does_not_store_result_when_journal_changes_during_read(tm
 
     import api.run_journal as run_journal
 
-    original_read = run_journal._read_jsonl
+    original_probe = run_journal._probe_state_for
 
-    def append_after_read(path):
-        events, malformed = original_read(path)
+    def probe_after_append(path):
+        state = original_probe(path)
         append_run_event(
             "session_1",
             "run_1",
@@ -231,9 +231,9 @@ def test_summary_cache_does_not_store_result_when_journal_changes_during_read(tm
             {"message": "Cancelled by user"},
             session_dir=tmp_path,
         )
-        return events, malformed
+        return state
 
-    monkeypatch.setattr(run_journal, "_read_jsonl", append_after_read)
+    monkeypatch.setattr(run_journal, "_probe_state_for", probe_after_append)
 
     first = latest_run_summary("session_1", "run_1", session_dir=tmp_path)
     second = latest_run_summary("session_1", "run_1", session_dir=tmp_path)
@@ -246,12 +246,12 @@ def test_summary_cache_does_not_store_result_when_journal_changes_during_read(tm
 def test_summary_cache_rejects_first_append_that_races_missing_journal_read(tmp_path, monkeypatch):
     import api.run_journal as run_journal
 
-    original_read = run_journal._read_jsonl
+    original_probe = run_journal._probe_state_for
     appended = False
 
-    def append_after_missing_read(path):
+    def probe_after_missing_read(path):
         nonlocal appended
-        events, malformed = original_read(path)
+        state = original_probe(path)
         if not appended:
             appended = True
             append_run_event(
@@ -261,9 +261,9 @@ def test_summary_cache_rejects_first_append_that_races_missing_journal_read(tmp_
                 {"session": {}},
                 session_dir=tmp_path,
             )
-        return events, malformed
+        return state
 
-    monkeypatch.setattr(run_journal, "_read_jsonl", append_after_missing_read)
+    monkeypatch.setattr(run_journal, "_probe_state_for", probe_after_missing_read)
 
     raced = latest_run_summary("session_1", "run_first_append", session_dir=tmp_path)
     refreshed = latest_run_summary("session_1", "run_first_append", session_dir=tmp_path)

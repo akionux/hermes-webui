@@ -355,7 +355,7 @@ def test_live_journal_snapshot_reconstructs_visible_progress_and_tool_aliases(mo
     )
     monkeypatch.setattr(
         routes,
-        "read_run_events",
+        "read_filtered_run_events",
         lambda session_id, run_id: {
             "events": [
                 {
@@ -616,7 +616,7 @@ def test_live_journal_snapshot_bounds_pathological_tool_args(monkeypatch):
     )
     monkeypatch.setattr(
         routes,
-        "read_run_events",
+        "read_filtered_run_events",
         lambda session_id, run_id: {
             "events": [
                 {

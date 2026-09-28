@@ -162,6 +162,149 @@ def _discard_cached_summary(path: Path) -> None:
         _SUMMARY_CACHE.pop(str(path), None)
 
 
+# --------------------------------------------------------------------------
+# Bounded incremental journal probe state (Task 2 / #1925 perf follow-up).
+#
+# ``latest_run_summary`` / ``find_run_summary`` only need terminal state, the
+# seq watermark and the last event — but the original path full-parsed the
+# whole journal per call (read_text + json.loads per line), and the summary
+# cache signature changes on every append, so an in-flight 100 MB+ journal was
+# re-parsed on EVERY request (measured 100-112 s session detail loads on
+# RK3568/eMMC). Probe state is now built once per file; later appends fold in
+# by parsing only the bytes appended since the last scan. Head lines are
+# counted with a C-speed newline scan (never json-parsed), so probing costs
+# O(new bytes) instead of O(file). ``event_count`` therefore counts journal
+# LINES (valid payloads and rare malformed rows alike) — it is only ever
+# consumed as a truthy "has events" watermark, never as an exact valid-row
+# count.
+# --------------------------------------------------------------------------
+_PROBE_TAIL_PARSE_BYTES = 4 * 1024 * 1024
+_PROBE_STATE_MAX_ENTRIES = 128
+_PROBE_STATE: "OrderedDict[str, dict]" = OrderedDict()
+_PROBE_STATE_LOCK = threading.Lock()
+
+
+def _merge_probe_lines(state: dict, raw_lines: list[bytes]) -> None:
+    """Fold one parsed region of journal lines into a probe state.
+
+    Terminal precedence matches ``select_authoritative_terminal_event``: the
+    latest NON-``stream_end`` terminal row wins; ``stream_end`` only owns the
+    verdict when no semantic terminal was ever seen.
+    """
+    for raw in raw_lines:
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        state["event_count"] += 1
+        try:
+            event = json.loads(stripped)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(event, dict):
+            continue
+        seq = int(event.get("seq") or 0)
+        if seq >= int(state["last_seq"] or 0):
+            state["last_seq"] = seq
+            state["last_event_id"] = event.get("event_id")
+            state["last_event"] = event
+        if event.get("terminal"):
+            if str(event.get("event") or "") != "stream_end":
+                state["terminal_event"] = event
+            elif state["terminal_event"] is None:
+                state["terminal_event"] = event
+
+
+def _probe_state_for(path: Path) -> dict | None:
+    """Incremental probe state for one journal file (None when the file is gone).
+
+    Warm path (same inode + growth): read and parse ONLY bytes past
+    ``bytes_parsed``. Cold seed: newline-count every line (cheap byte scan),
+    then json-parse at most the last ``_PROBE_TAIL_PARSE_BYTES`` — terminal and
+    last-seq rows always live in that tail for real runs. A non-append rewrite
+    or an unreadable file reseeds; a vanished file returns None.
+    """
+    key = str(path)
+    with _PROBE_STATE_LOCK:
+        state = _PROBE_STATE.get(key)
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    signature = (int(stat.st_dev), int(stat.st_ino), int(stat.st_size),
+                 int(stat.st_mtime_ns), int(stat.st_ctime_ns))
+    if state is not None and state["signature"] == signature:
+        with _PROBE_STATE_LOCK:
+            if _PROBE_STATE.get(key) is state:
+                _PROBE_STATE.move_to_end(key)
+        return state
+    if state is not None and state["signature"][0] == signature[0] \
+            and state["signature"][1] == signature[1] \
+            and signature[2] > state["bytes_parsed"]:
+        # Same inode, pure append: fold ONLY the new region (line-aligned since
+        # every append ends its line, so bytes_parsed always sits on one).
+        try:
+            with path.open("rb") as fh:
+                fh.seek(state["bytes_parsed"])
+                raw_new = fh.read()
+        except OSError:
+            return state
+        lines = raw_new.split(b"\n")
+        if lines and lines[-1] == b"":
+            lines.pop()
+        _merge_probe_lines(state, lines)
+        state["bytes_parsed"] = signature[2]
+        state["signature"] = signature
+        with _PROBE_STATE_LOCK:
+            _PROBE_STATE[key] = state
+            _PROBE_STATE.move_to_end(key)
+        return state
+    # Cold seed: byte-scan the whole file for line count; parse only the tail.
+    try:
+        size = signature[2]
+        tail_start = max(0, size - _PROBE_TAIL_PARSE_BYTES)
+        head_lines = 0
+        if tail_start:
+            with path.open("rb") as fh:
+                remaining = tail_start
+                while remaining > 0:
+                    chunk = fh.read(min(remaining, 1 << 20))
+                    if not chunk:
+                        break
+                    remaining -= len(chunk)
+                    head_lines += chunk.count(b"\n")
+        with path.open("rb") as fh:
+            if tail_start:
+                fh.seek(tail_start)
+                raw_tail = fh.read()
+            else:
+                raw_tail = fh.read()
+    except OSError:
+        return None
+    tail_lines = raw_tail.split(b"\n")
+    if tail_lines and tail_lines[-1] == b"":
+        tail_lines.pop()
+    state = {
+        "signature": signature,
+        "bytes_parsed": size,
+        "event_count": head_lines + len(tail_lines),
+        "last_seq": 0,
+        "last_event_id": None,
+        "last_event": None,
+        "terminal_event": None,
+    }
+    # The first window line may be a partial (pre-window bytes were counted in
+    # head_lines only if they ended before tail_start); json.loads simply skips
+    # unparseable partials without inflating parsed fields — its line was still
+    # counted above, keeping event_count == journal line count.
+    _merge_probe_lines(state, tail_lines)
+    with _PROBE_STATE_LOCK:
+        _PROBE_STATE[key] = state
+        _PROBE_STATE.move_to_end(key)
+        while len(_PROBE_STATE) > _PROBE_STATE_MAX_ENTRIES:
+            _PROBE_STATE.popitem(last=False)
+    return state
+
+
 def _read_jsonl(path: Path) -> tuple[list[dict], list[dict]]:
     events: list[dict] = []
     malformed: list[dict] = []
@@ -588,14 +731,47 @@ def _summary_from_events(session_id: str, run_id: str, events: Iterable[dict]) -
     }
 
 
+def _summary_from_probe_state(session_id: str, run_id: str, state: dict | None) -> dict:
+    """Same summary shape as _summary_from_events, from incremental probe state."""
+    if state is None:
+        last: dict = {}
+        terminal: dict | None = None
+        count = 0
+    else:
+        terminal = state.get("terminal_event")
+        last = state.get("last_event") or {}
+        count = int(state.get("event_count") or 0)
+    if terminal is not None:
+        status = terminal.get("terminal_state")
+    elif count:
+        status = "running"
+    else:
+        status = "unknown"
+    return {
+        "session_id": str(session_id),
+        "run_id": str(run_id),
+        "stream_id": str(run_id),
+        "event_count": count,
+        "last_seq": int((state or {}).get("last_seq") or 0),
+        "last_event_id": last.get("event_id"),
+        "terminal": bool(terminal),
+        "terminal_state": status,
+        "last_event": last.get("event"),
+    }
+
+
 def latest_run_summary(session_id: str, run_id: str, *, session_dir: Path | None = None) -> dict:
     path = _run_path(session_id, run_id, session_dir=session_dir)
     cached = _get_cached_summary(path)
     if cached is not None:
         return cached
     pre_read_signature = _summary_cache_signature(path)
-    events, _malformed = _read_jsonl(path)
-    summary = _summary_from_events(session_id, run_id, events)
+    state = _probe_state_for(path)
+    summary = _summary_from_probe_state(session_id, run_id, state)
+    if state is None and pre_read_signature is not None:
+        # Not an append we can model (should not happen); keep old semantics.
+        events, _malformed = _read_jsonl(path)
+        summary = _summary_from_events(session_id, run_id, events)
     _cache_summary(path, summary, expected_signature=pre_read_signature)
     return summary
 
@@ -643,8 +819,11 @@ def find_run_summary(run_id: str, *, session_dir: Path | None = None) -> dict | 
         summary = _get_cached_summary(path)
         if summary is None:
             pre_read_signature = _summary_cache_signature(path)
-            events, _malformed = _read_jsonl(path)
-            summary = _summary_from_events(session_id, rid, events)
+            state = _probe_state_for(path)
+            summary = _summary_from_probe_state(session_id, rid, state)
+            if state is None and pre_read_signature is not None:
+                events, _malformed = _read_jsonl(path)
+                summary = _summary_from_events(session_id, rid, events)
             _cache_summary(path, summary, expected_signature=pre_read_signature)
         summary["path"] = str(path)
         return summary
@@ -788,6 +967,110 @@ def read_session_run_events(
     }
 
 
+# --------------------------------------------------------------------------
+# Bounded filtered reader for the live transcript snapshot (Task 2).
+#
+# The live snapshot needs the run's CONTENT events (submitted/token/reasoning/
+# interim_assistant/tool*/done...), never its telemetry (metering/
+# context_status/anchor_activity made ~99.9% of an in-flight journal's bytes and
+# every one of them used to be json.loads-ed per request). Telemetry lines are
+# now rejected with a raw-bytes marker check — no json.loads — and already
+# parsed content events live in the incremental per-path state, so a mid-turn
+# detail load folds only the bytes appended since the last load.
+# --------------------------------------------------------------------------
+_SNAPSHOT_CONTENT_EVENTS = frozenset({
+    "submitted", "token", "reasoning", "interim_assistant",
+    "tool", "tool_complete", "assistant_started",
+    "done", "cancel", "apperror", "error", "stream_end",
+})
+_EVENT_NAME_RE = re.compile(rb'"(?:event|type)":\s*"([a-z_]+)"')
+_FILTERED_STATE: "OrderedDict[str, dict]" = OrderedDict()
+_FILTERED_STATE_LOCK = threading.Lock()
+
+
+def _filtered_state_for(path: Path) -> dict | None:
+    key = str(path)
+    with _FILTERED_STATE_LOCK:
+        state = _FILTERED_STATE.get(key)
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    signature = (int(stat.st_dev), int(stat.st_ino), int(stat.st_size),
+                 int(stat.st_mtime_ns), int(stat.st_ctime_ns))
+    if state is not None and state["signature"] == signature:
+        with _FILTERED_STATE_LOCK:
+            if _FILTERED_STATE.get(key) is state:
+                _FILTERED_STATE.move_to_end(key)
+        return state
+    warm = (
+        state is not None
+        and state["signature"][0] == signature[0]
+        and state["signature"][1] == signature[1]
+        and signature[2] > state["bytes_parsed"]
+    )
+    if not warm:
+        state = {"signature": signature, "bytes_parsed": 0, "events": [], "malformed": []}
+    try:
+        with path.open("rb") as fh:
+            fh.seek(state["bytes_parsed"])
+            raw_new = fh.read()
+    except OSError:
+        return state if state["events"] else None
+    for raw in raw_new.split(b"\n"):
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        marker = _EVENT_NAME_RE.search(stripped)
+        if marker is None or marker.group(1).decode("ascii", "replace") not in _SNAPSHOT_CONTENT_EVENTS:
+            continue  # telemetry / unknown — never part of the transcript snapshot
+        try:
+            parsed = json.loads(stripped)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            state["malformed"].append({"raw": stripped})
+            continue
+        if isinstance(parsed, dict):
+            state["events"].append(parsed)
+    state["bytes_parsed"] = signature[2]
+    state["signature"] = signature
+    with _FILTERED_STATE_LOCK:
+        _FILTERED_STATE[key] = state
+        _FILTERED_STATE.move_to_end(key)
+        while len(_FILTERED_STATE) > _PROBE_STATE_MAX_ENTRIES:
+            _FILTERED_STATE.popitem(last=False)
+    return state
+
+
+def read_filtered_run_events(
+    session_id: str,
+    run_id: str,
+    *,
+    after_seq: int | None = None,
+    max_seq: int | None = None,
+    session_dir: Path | None = None,
+) -> dict:
+    """Content-only, incremental mirror of :func:`read_run_events`.
+
+    Returns the same ``{"events", "malformed"}`` shape as read_run_events for
+    the snapshot/replay callers, but telemetry lines are skipped without being
+    parsed and each appended region is json-parsed exactly once per process.
+    """
+    path = _run_path(session_id, run_id, session_dir=session_dir)
+    state = _filtered_state_for(path)
+    events = list((state or {}).get("events") or [])
+    malformed = list((state or {}).get("malformed") or [])
+    if after_seq is not None:
+        events = [e for e in events if int(e.get("seq") or 0) > int(after_seq)]
+    if max_seq is not None:
+        events = [e for e in events if int(e.get("seq") or 0) <= int(max_seq)]
+    return {
+        "session_id": str(session_id),
+        "run_id": str(run_id),
+        "events": events,
+        "malformed": malformed,
+    }
+
+
 def delete_run_journal(session_id: str, *, session_dir: Path | None = None) -> bool:
     """Remove the entire per-session run-journal directory (``_run_journal/{sid}/``).
 
@@ -839,6 +1122,12 @@ def delete_run_journal(session_id: str, *, session_dir: Path | None = None) -> b
         with _SUMMARY_CACHE_LOCK:
             for cache_key in [entry for entry in _SUMMARY_CACHE if str(Path(entry).parent) == dir_key]:
                 del _SUMMARY_CACHE[cache_key]
+        with _PROBE_STATE_LOCK:
+            for cache_key in [entry for entry in _PROBE_STATE if str(Path(entry).parent) == dir_key]:
+                del _PROBE_STATE[cache_key]
+        with _FILTERED_STATE_LOCK:
+            for cache_key in [entry for entry in _FILTERED_STATE if str(Path(entry).parent) == dir_key]:
+                del _FILTERED_STATE[cache_key]
     return removed
 
 
