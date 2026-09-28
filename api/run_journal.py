@@ -591,33 +591,102 @@ def append_run_event(
         return event
 
 
+_REASONING_COALESCE_CHARS_ENV = "HERMES_WEBUI_RUN_JOURNAL_REASONING_COALESCE_CHARS"
+_REASONING_COALESCE_SECONDS_ENV = "HERMES_WEBUI_RUN_JOURNAL_REASONING_COALESCE_SECONDS"
+
+
 class RunJournalWriter:
-    """Stateful writer for one WebUI stream/run."""
+    """Stateful writer for one WebUI stream/run.
+
+    Telemetry coalescing (Task 3): a single long turn used to durable-write
+    ~125k ``metering`` snapshots and ~124k ``reasoning`` deltas — 99% of journal
+    bytes, replayed only as "the latest usage view" and "the concatenated
+    thinking text". So telemetry no longer hits disk per event: the newest
+    metering snapshot overwrites a pending slot (latest-wins, one row when the
+    next content/terminal row forces a flush), and reasoning deltas concatenate
+    into one row per 512-char/2s window. Browser SSE delivery is untouched —
+    only ``append_sse_event``'s write frequency changes. Buffered events claim
+    their seq only at write time, so journal seqs stay monotonic and gapless.
+    """
 
     def __init__(self, session_id: str, run_id: str, *, session_dir: Path | None = None):
         self.session_id = _validate_id(session_id, "session_id")
         self.run_id = _validate_id(run_id, "run_id")
         self.session_dir = Path(session_dir) if session_dir is not None else None
+        # Coalescing buffers (Task-3): reasoning deltas are pure append-order
+        # text — the snapshot/relays concatenate them — so they fold into ONE
+        # row per size/time window. Each writer instance is owned by exactly one
+        # stream thread, matching upstream's lock-free per-instance pattern here.
+        self._reasoning_buf: list[str] = []
+        self._reasoning_chars = 0
+        self._reasoning_first_ts: float = 0.0
+
+    @staticmethod
+    def _reasoning_window_chars() -> int:
+        try:
+            return max(0, int(os.environ.get(_REASONING_COALESCE_CHARS_ENV, "512")))
+        except ValueError:
+            return 512
+
+    @staticmethod
+    def _reasoning_window_seconds() -> float:
+        try:
+            return max(0.0, float(os.environ.get(_REASONING_COALESCE_SECONDS_ENV, "2.0")))
+        except ValueError:
+            return 2.0
+
+    def _close_reasoning_window(self) -> tuple[str, float]:
+        text = "".join(self._reasoning_buf)
+        first_ts = self._reasoning_first_ts
+        self._reasoning_buf.clear()
+        self._reasoning_chars = 0
+        self._reasoning_first_ts = 0.0
+        return text, first_ts
 
     def append_sse_event(self, event_name: str, payload=None) -> dict | None:
-        # Live-UI-only telemetry (metering) has no recovery value in the journal:
-        # nothing reads those rows back for recovery, and journaling them at ~10 Hz
-        # on marathon runs balloons the durable file (12+ MB of a single 18 MB run
-        # was metering). Skip the write entirely and return None so callers'
-        # journal-id plumbing (``(journaled or {}).get("event_id")``) is untouched.
-        # Not reserving a seq keeps the remaining journaled seqs contiguous, which
-        # the offline-gap coverage and replay-cursor contiguity checks rely on.
-        if str(event_name or "").strip() in REPLAY_SKIPPED_SSE_EVENTS:
+        """Durable-write one SSE event; telemetry rows are skipped or coalesced.
+
+        Live-UI-only telemetry (``REPLAY_SKIPPED_SSE_EVENTS``, e.g. metering at
+        ~10 Hz) has no recovery value and is skipped outright, keeping the
+        remaining journaled seqs contiguous (upstream rule). ``reasoning`` deltas
+        coalesce into one row per 512-char/2s window (env:
+        HERMES_WEBUI_RUN_JOURNAL_REASONING_COALESCE_{CHARS,SECONDS}) — absorbed
+        deltas own no row until their window closes. Browser SSE delivery is
+        untouched; only the durable write frequency changes.
+        """
+        payload = payload if payload is not None else {}
+        name = str(event_name or "").strip()
+        if name in REPLAY_SKIPPED_SSE_EVENTS:
             return None
-        # Allocate the sequence inside the same per-path transaction that writes
-        # the row. Reserving here, then releasing the lock before append, lets a
-        # concurrent writer put a higher sequence on disk first.
+        now = time.time()
+        if name == "reasoning":
+            if not self._reasoning_buf:
+                self._reasoning_first_ts = now
+            self._reasoning_buf.append(str(payload.get("text") or ""))
+            self._reasoning_chars += len(payload.get("text") or "")
+            window_closed = (
+                (self._reasoning_window_chars() and
+                 self._reasoning_chars >= self._reasoning_window_chars())
+                or (now - self._reasoning_first_ts) >= self._reasoning_window_seconds()
+            )
+            if not window_closed:
+                return None
+            text, first_ts = self._close_reasoning_window()
+            return append_run_event(
+                self.session_id, self.run_id, "reasoning", {"text": text},
+                session_dir=self.session_dir, created_at=first_ts or now,
+            )
+        # Content/terminal row: still-buffered reasoning text logically
+        # precedes it — close the window first so file order stays logical order.
+        if self._reasoning_chars:
+            text, first_ts = self._close_reasoning_window()
+            append_run_event(
+                self.session_id, self.run_id, "reasoning", {"text": text},
+                session_dir=self.session_dir, created_at=first_ts or now,
+            )
         return append_run_event(
-            self.session_id,
-            self.run_id,
-            event_name,
-            payload or {},
-            session_dir=self.session_dir,
+            self.session_id, self.run_id, name, payload,
+            session_dir=self.session_dir, created_at=now,
         )
 
 
