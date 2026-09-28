@@ -6702,7 +6702,17 @@ _available_models_cache_ts: float = 0.0
 _available_models_live_rebuild_ts: float = 0.0
 _available_models_cache_source_fingerprint: dict | None = None
 _AVAILABLE_MODELS_CACHE_TTL: float = 86400.0  # 24 hours
-_SESSION_VISIT_MODELS_FRESHNESS_SECONDS: float = 300.0
+# Session-visit freshness horizon. Inside it, /api/models?freshness=session_visit
+# returns the disk/memory catalog WITHOUT any provider HTTPS probe. The old 300s
+# default meant every page visit past 5 minutes paid a full live rebuild (6-7s
+# measured on RK3568). Model lists going stale by an hour is invisible to users;
+# explicit user actions still force a refresh via their own endpoints.
+try:
+    _SESSION_VISIT_MODELS_FRESHNESS_SECONDS: float = float(
+        os.getenv("HERMES_WEBUI_SESSION_VISIT_MODELS_FRESHNESS_SECONDS", "3600") or "3600"
+    )
+except (TypeError, ValueError):
+    _SESSION_VISIT_MODELS_FRESHNESS_SECONDS = 3600.0
 _available_models_cache_lock = threading.RLock()  # must be RLock: cold path refactoring moved slow work inside this lock, requiring re-entry
 _cache_build_cv = threading.Condition(_available_models_cache_lock)  # shares underlying RLock so notify_all() is safe inside with _available_models_cache_lock
 _cache_build_in_progress = False  # True while a cold path is actively building
@@ -6835,10 +6845,10 @@ def _endpoint_advertised_model_ids(provider_id: str | None) -> frozenset | None:
 # (unbounded) behaviour.
 try:
     _LIVE_REBUILD_BUDGET_SECONDS: float = float(
-        os.getenv("HERMES_WEBUI_MODELS_REBUILD_BUDGET", "4") or "4"
+        os.getenv("HERMES_WEBUI_MODELS_REBUILD_BUDGET", "1") or "1"
     )
 except (TypeError, ValueError):
-    _LIVE_REBUILD_BUDGET_SECONDS = 4.0
+    _LIVE_REBUILD_BUDGET_SECONDS = 1.0
 
 
 # ── Budget-exceeded warning rate-limit ───────────────────────────────────────
